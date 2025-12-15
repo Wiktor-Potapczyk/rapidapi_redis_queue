@@ -25,6 +25,94 @@ REDIS_EXPIRATION = 3600
 GLOBAL_HEADERS = json.loads(os.getenv("GLOBAL_HEADERS", "{}"))
 
 redis_client: Optional[redis.Redis] = None
+MAX_WEBHOOK_SIZE_BYTES = 100 * 1024  # 100 KB
+
+
+def is_linkedin_reactions_endpoint(url: str) -> bool:
+    """Check if the URL is a LinkedIn user reactions endpoint."""
+    return "fresh-linkedin-scraper-api.p.rapidapi.com/api/v1/user/reactions" in url
+
+
+def extract_linkedin_reaction_texts(response_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract only the 'text' field from LinkedIn reactions posts and concatenate them."""
+    if not isinstance(response_data, dict):
+        return response_data
+
+    # Create a copy of the response to modify
+    result = response_data.copy()
+
+    # Check if 'data' array exists
+    if 'data' in result and isinstance(result['data'], list):
+        texts = []
+        for item in result['data']:
+            if isinstance(item, dict) and 'post' in item and isinstance(item['post'], dict):
+                text = item['post'].get('text', '')
+                if text:
+                    texts.append(text)
+
+        # Concatenate all texts with double newline separator
+        result['data'] = '\n\n'.join(texts)
+
+    return result
+
+
+def truncate_to_size_limit(payload: Dict[str, Any], max_bytes: int = MAX_WEBHOOK_SIZE_BYTES) -> Dict[str, Any]:
+    """Truncate webhook payload to fit within size limit, keeping newest data."""
+    payload_json = json.dumps(payload)
+
+    # If payload is within limit, return as-is
+    if len(payload_json.encode('utf-8')) <= max_bytes:
+        return payload
+
+    logger.warning(f"Payload size {len(payload_json.encode('utf-8'))} bytes exceeds {max_bytes} bytes limit")
+
+    # If api_response has a 'data' field, truncate it
+    if 'api_response' in payload and isinstance(payload['api_response'], dict):
+        api_response = payload['api_response']
+
+        # Handle string data (e.g., concatenated LinkedIn reactions)
+        if 'data' in api_response and isinstance(api_response['data'], str):
+            truncated_payload = payload.copy()
+            truncated_payload['api_response'] = api_response.copy()
+
+            data_str = api_response['data']
+            original_length = len(data_str)
+
+            # Keep truncating from the end until it fits
+            while data_str and len(json.dumps(truncated_payload).encode('utf-8')) > max_bytes:
+                # Remove characters from the end (oldest data)
+                data_str = data_str[:-100]  # Remove 100 chars at a time
+                truncated_payload['api_response']['data'] = data_str
+
+            if data_str:
+                truncated_payload['_truncated'] = True
+                truncated_payload['_original_length'] = original_length
+                truncated_payload['_truncated_length'] = len(data_str)
+                logger.info(f"Truncated string data from {original_length} to {len(data_str)} characters")
+                return truncated_payload
+
+        # Handle array data
+        elif 'data' in api_response and isinstance(api_response['data'], list):
+            truncated_payload = payload.copy()
+            truncated_payload['api_response'] = api_response.copy()
+
+            # Keep removing items from the end until it fits
+            data_items = api_response['data'].copy()
+
+            while data_items and len(json.dumps(truncated_payload).encode('utf-8')) > max_bytes:
+                data_items.pop()  # Remove oldest item (last in array)
+                truncated_payload['api_response']['data'] = data_items
+
+            if data_items:
+                truncated_payload['_truncated'] = True
+                truncated_payload['_original_item_count'] = len(api_response['data'])
+                truncated_payload['_truncated_item_count'] = len(data_items)
+                logger.info(f"Truncated data from {len(api_response['data'])} to {len(data_items)} items")
+                return truncated_payload
+
+    # If we can't truncate intelligently, just note the issue
+    logger.error("Unable to truncate payload to size limit")
+    return payload
 
 
 async def update_job_status(job_id: str, status: str, result=None, error=None):
@@ -73,6 +161,11 @@ async def process_job(job: Dict[str, Any]):
             except json.JSONDecodeError:
                 response_data = {"raw_text": response.text}
 
+            # Apply LinkedIn reactions text extraction if applicable
+            if is_linkedin_reactions_endpoint(target_url):
+                logger.info(f"Extracting text-only from LinkedIn reactions for {job_id}")
+                response_data = extract_linkedin_reaction_texts(response_data)
+
             logger.info(f"Success {job_id}: {response.status_code}")
 
             webhook_payload = job.copy()
@@ -81,6 +174,9 @@ async def process_job(job: Dict[str, Any]):
             webhook_payload["api_status_code"] = response.status_code
             webhook_payload["api_response"] = response_data
             webhook_payload["processed_at"] = time.time()
+
+            # Truncate payload to 100KB limit (keeping newest data)
+            webhook_payload = truncate_to_size_limit(webhook_payload)
 
             webhook_url = job.get('callback_webhook_url')
             webhook_status = None
