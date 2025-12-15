@@ -28,12 +28,9 @@ redis_client: Optional[redis.Redis] = None
 MAX_WEBHOOK_SIZE_BYTES = 100 * 1024  # 100 KB
 
 
-def is_linkedin_reactions_endpoint(url: str) -> bool:
-    """Check if the URL is a LinkedIn user reactions endpoint."""
-    return "fresh-linkedin-scraper-api.p.rapidapi.com/api/v1/user/reactions" in url
+# ==================== ENDPOINT-SPECIFIC TRANSFORMATIONS ====================
 
-
-def extract_linkedin_reaction_texts(response_data: Dict[str, Any]) -> Dict[str, Any]:
+def transform_linkedin_reactions_text_only(response_data: Dict[str, Any]) -> Dict[str, Any]:
     """Extract only the 'text' field from LinkedIn reactions posts and concatenate them."""
     if not isinstance(response_data, dict):
         return response_data
@@ -54,6 +51,35 @@ def extract_linkedin_reaction_texts(response_data: Dict[str, Any]) -> Dict[str, 
         result['data'] = '\n\n'.join(texts)
 
     return result
+
+
+def apply_endpoint_transformation(url: str, response_data: Dict[str, Any], opcja: Optional[str] = None) -> Dict[str, Any]:
+    """Apply endpoint-specific transformations based on URL and opcja parameter.
+
+    Args:
+        url: The target API URL
+        response_data: The response data to transform
+        opcja: Optional parameter - if "oryginal", skip transformations
+
+    Returns:
+        Transformed response data
+    """
+    # If opcja is "oryginal", return data as-is
+    if opcja == "oryginal":
+        logger.info("opcja=oryginal - skipping transformations")
+        return response_data
+
+    # LinkedIn reactions endpoint
+    if "fresh-linkedin-scraper-api.p.rapidapi.com/api/v1/user/reactions" in url:
+        logger.info("Applying LinkedIn reactions text-only transformation")
+        return transform_linkedin_reactions_text_only(response_data)
+
+    # Add more endpoint-specific transformations here:
+    # elif "some-other-api.com/endpoint" in url:
+    #     return transform_some_other_endpoint(response_data)
+
+    # Default: return unchanged
+    return response_data
 
 
 def truncate_to_size_limit(payload: Dict[str, Any], max_bytes: int = MAX_WEBHOOK_SIZE_BYTES) -> Dict[str, Any]:
@@ -138,12 +164,13 @@ async def process_job(job: Dict[str, Any]):
     target_url = job['target_api_url']
     method = job.get('request_method', 'GET').upper()
     request_body = job.get('request_body')
-    
+    opcja = job.get('opcja')  # Get opcja parameter
+
     headers = GLOBAL_HEADERS.copy()
     if job.get('request_headers'):
         headers.update(job['request_headers'])
 
-    logger.info(f"Processing {job_id} -> {method} {target_url}")
+    logger.info(f"Processing {job_id} -> {method} {target_url} (opcja={opcja})")
 
     async with httpx.AsyncClient() as client:
         try:
@@ -161,10 +188,8 @@ async def process_job(job: Dict[str, Any]):
             except json.JSONDecodeError:
                 response_data = {"raw_text": response.text}
 
-            # Apply LinkedIn reactions text extraction if applicable
-            if is_linkedin_reactions_endpoint(target_url):
-                logger.info(f"Extracting text-only from LinkedIn reactions for {job_id}")
-                response_data = extract_linkedin_reaction_texts(response_data)
+            # Apply endpoint-specific transformations
+            response_data = apply_endpoint_transformation(target_url, response_data, opcja)
 
             logger.info(f"Success {job_id}: {response.status_code}")
 
