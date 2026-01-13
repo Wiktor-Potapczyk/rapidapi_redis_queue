@@ -10,6 +10,8 @@ from fastapi import FastAPI, Response, Request
 from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any
 
+# ==================== CONFIGURATION ====================
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -28,7 +30,7 @@ redis_client: Optional[redis.Redis] = None
 MAX_WEBHOOK_SIZE_BYTES = 100 * 1024  # 100 KB
 
 
-# ==================== ENDPOINT-SPECIFIC TRANSFORMATIONS ====================
+# ==================== TRANSFORMATIONS ====================
 
 def transform_linkedin_reactions_text_only(response_data: Dict[str, Any]) -> Dict[str, Any]:
     """Extract only the 'text' field from LinkedIn reactions posts and concatenate them."""
@@ -54,31 +56,15 @@ def transform_linkedin_reactions_text_only(response_data: Dict[str, Any]) -> Dic
 
 
 def apply_endpoint_transformation(url: str, response_data: Dict[str, Any], opcja: Optional[str] = None) -> Dict[str, Any]:
-    """Apply endpoint-specific transformations based on URL and opcja parameter.
-
-    Args:
-        url: The target API URL
-        response_data: The response data to transform
-        opcja: Optional parameter - if "oryginal", skip transformations
-
-    Returns:
-        Transformed response data
-    """
-    # If opcja is "oryginal", return data as-is
+    """Apply endpoint-specific transformations based on URL and opcja parameter."""
     if opcja == "oryginal":
         logger.info("opcja=oryginal - skipping transformations")
         return response_data
 
-    # LinkedIn reactions endpoint
     if "fresh-linkedin-scraper-api.p.rapidapi.com/api/v1/user/reactions" in url:
         logger.info("Applying LinkedIn reactions text-only transformation")
         return transform_linkedin_reactions_text_only(response_data)
 
-    # Add more endpoint-specific transformations here:
-    # elif "some-other-api.com/endpoint" in url:
-    #     return transform_some_other_endpoint(response_data)
-
-    # Default: return unchanged
     return response_data
 
 
@@ -86,60 +72,52 @@ def truncate_to_size_limit(payload: Dict[str, Any], max_bytes: int = MAX_WEBHOOK
     """Truncate webhook payload to fit within size limit, keeping newest data."""
     payload_json = json.dumps(payload)
 
-    # If payload is within limit, return as-is
     if len(payload_json.encode('utf-8')) <= max_bytes:
         return payload
 
     logger.warning(f"Payload size {len(payload_json.encode('utf-8'))} bytes exceeds {max_bytes} bytes limit")
 
-    # If api_response has a 'data' field, truncate it
     if 'api_response' in payload and isinstance(payload['api_response'], dict):
         api_response = payload['api_response']
 
-        # Handle string data (e.g., concatenated LinkedIn reactions)
+        # Handle string data
         if 'data' in api_response and isinstance(api_response['data'], str):
             truncated_payload = payload.copy()
             truncated_payload['api_response'] = api_response.copy()
-
             data_str = api_response['data']
             original_length = len(data_str)
 
-            # Keep truncating from the end until it fits
             while data_str and len(json.dumps(truncated_payload).encode('utf-8')) > max_bytes:
-                # Remove characters from the end (oldest data)
-                data_str = data_str[:-100]  # Remove 100 chars at a time
+                data_str = data_str[:-100]
                 truncated_payload['api_response']['data'] = data_str
 
             if data_str:
                 truncated_payload['_truncated'] = True
                 truncated_payload['_original_length'] = original_length
                 truncated_payload['_truncated_length'] = len(data_str)
-                logger.info(f"Truncated string data from {original_length} to {len(data_str)} characters")
                 return truncated_payload
 
         # Handle array data
         elif 'data' in api_response and isinstance(api_response['data'], list):
             truncated_payload = payload.copy()
             truncated_payload['api_response'] = api_response.copy()
-
-            # Keep removing items from the end until it fits
             data_items = api_response['data'].copy()
 
             while data_items and len(json.dumps(truncated_payload).encode('utf-8')) > max_bytes:
-                data_items.pop()  # Remove oldest item (last in array)
+                data_items.pop()
                 truncated_payload['api_response']['data'] = data_items
 
             if data_items:
                 truncated_payload['_truncated'] = True
                 truncated_payload['_original_item_count'] = len(api_response['data'])
                 truncated_payload['_truncated_item_count'] = len(data_items)
-                logger.info(f"Truncated data from {len(api_response['data'])} to {len(data_items)} items")
                 return truncated_payload
 
-    # If we can't truncate intelligently, just note the issue
     logger.error("Unable to truncate payload to size limit")
     return payload
 
+
+# ==================== CORE LOGIC ====================
 
 async def update_job_status(job_id: str, status: str, result=None, error=None):
     payload = {
@@ -160,11 +138,15 @@ async def update_job_status(job_id: str, status: str, result=None, error=None):
 
 
 async def process_job(job: Dict[str, Any]):
+    """Process a single job and ensure webhook is sent even on failure."""
     job_id = job['job_id']
     target_url = job['target_api_url']
     method = job.get('request_method', 'GET').upper()
     request_body = job.get('request_body')
-    opcja = job.get('opcja')  # Get opcja parameter
+    opcja = job.get('opcja')
+    
+    # We normalized this in queue_job, so it should be correct now
+    webhook_url = job.get('callback_webhook_url')
 
     headers = GLOBAL_HEADERS.copy()
     if job.get('request_headers'):
@@ -174,6 +156,7 @@ async def process_job(job: Dict[str, Any]):
 
     async with httpx.AsyncClient() as client:
         try:
+            # 1. Perform the API Request
             if method == 'POST':
                 response = await client.post(target_url, headers=headers, json=request_body, timeout=30.0)
             elif method == 'PUT':
@@ -183,43 +166,55 @@ async def process_job(job: Dict[str, Any]):
             else:
                 response = await client.get(target_url, headers=headers, timeout=30.0)
 
+            # 2. Parse Response
             try:
                 response_data = response.json()
             except json.JSONDecodeError:
                 response_data = {"raw_text": response.text}
 
-            # Apply endpoint-specific transformations
+            # 3. Apply Transformations
             response_data = apply_endpoint_transformation(target_url, response_data, opcja)
-
             logger.info(f"Success {job_id}: {response.status_code}")
 
+            # 4. Prepare Success Webhook
             webhook_payload = job.copy()
             webhook_payload.pop("request_headers", None)
             webhook_payload.pop("request_body", None)
             webhook_payload["api_status_code"] = response.status_code
             webhook_payload["api_response"] = response_data
             webhook_payload["processed_at"] = time.time()
+            webhook_payload["status"] = "success"
 
-            # Truncate payload to 100KB limit (keeping newest data)
             webhook_payload = truncate_to_size_limit(webhook_payload)
-
-            webhook_url = job.get('callback_webhook_url')
-            webhook_status = None
             
+            # 5. Send Webhook
             if webhook_url:
                 try:
-                    webhook_response = await client.post(webhook_url, json=webhook_payload, timeout=10.0)
-                    webhook_status = webhook_response.status_code
-                    logger.info(f"Webhook sent for {job_id}: {webhook_status}")
+                    wb_resp = await client.post(webhook_url, json=webhook_payload, timeout=10.0)
+                    logger.info(f"Webhook sent for {job_id}: {wb_resp.status_code}")
                 except Exception as e:
-                    webhook_status = "failed"
-                    logger.error(f"Webhook failed for {job_id}: {e}")
+                    logger.error(f"Webhook delivery failed for {job_id}: {e}")
 
-            final_status = "completed" if webhook_status != "failed" else "completed_webhook_failed"
-            await update_job_status(job_id, final_status, result=response_data)
+            await update_job_status(job_id, "completed", result=response_data)
 
         except Exception as e:
+            # === CRITICAL FIX: Send Error Webhook ===
             logger.error(f"Job {job_id} failed: {e}")
+            
+            if webhook_url:
+                error_payload = {
+                    "job_id": job_id,
+                    "status": "error",
+                    "error_message": str(e),
+                    "target_url": target_url,
+                    "processed_at": time.time()
+                }
+                try:
+                    await client.post(webhook_url, json=error_payload, timeout=10.0)
+                    logger.info(f"Error webhook sent for {job_id}")
+                except Exception as we:
+                    logger.error(f"Failed to send error webhook for {job_id}: {we}")
+
             await update_job_status(job_id, "failed", error=str(e))
 
 
@@ -235,13 +230,13 @@ async def queue_worker():
                 if result:
                     _, raw_data = result
                     job = json.loads(raw_data)
-
                     start_time = time.monotonic()
 
                     try:
-                        await asyncio.wait_for(process_job(job), timeout=25.0)
+                        await asyncio.wait_for(process_job(job), timeout=45.0)
                     except asyncio.TimeoutError:
                         logger.error(f"Job {job.get('job_id')} timed out")
+                        # Note: process_job has internal timeout handling, this catches worker hangs
                         await update_job_status(job['job_id'], "timeout")
 
                     elapsed = time.monotonic() - start_time
@@ -254,6 +249,8 @@ async def queue_worker():
             logger.critical(f"Worker error: {e}")
             await asyncio.sleep(1)
 
+
+# ==================== LIFESPAN & API ====================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -285,12 +282,25 @@ async def queue_job(request: Request, response: Response):
         response.status_code = 400
         return {"error": "Invalid JSON"}
 
+    # === FIX 1: Normalize 'target_api' -> 'target_api_url' ===
     if "target_api_url" not in body:
         if "target_api" in body:
             body["target_api_url"] = body.pop("target_api")
         else:
             response.status_code = 400
             return {"error": "Missing required field: target_api_url"}
+
+    # === FIX 2: Normalize 'callback_webhook' -> 'callback_webhook_url' ===
+    if "callback_webhook_url" not in body and "callback_webhook" in body:
+        body["callback_webhook_url"] = body.pop("callback_webhook")
+
+    # === FIX 3: Normalize 'headers' -> 'request_headers' ===
+    if "request_headers" not in body and "headers" in body:
+        body["request_headers"] = body.pop("headers")
+
+    # === FIX 4: Clean the URL (Remove newlines and whitespace) ===
+    if body.get("target_api_url"):
+        body["target_api_url"] = str(body["target_api_url"]).strip()
 
     job_id = str(uuid.uuid4())
     body['job_id'] = job_id
