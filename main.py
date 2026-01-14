@@ -605,7 +605,7 @@ async def queue_job(request: Request, response: Response):
     # Synchronous processing (wait for result)
     if body.get('sync', True):  # Default to True per user request
         start_wait = time.time()
-        max_wait = 300  # 5 minutes timeout or configure via env
+        max_wait = 3600  # 1 hour timeout for large batches
         
         while time.time() - start_wait < max_wait:
             if redis_client:
