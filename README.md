@@ -9,7 +9,8 @@ A smart proxy service that queues API requests and processes them at a controlle
 1.  **Rate Limiting**: Queues requests in Redis and processes them one by one (e.g., every 3.5 seconds).
 2.  **Synchronous Mode (New!)**: The API waits for the job to complete and returns the result directly in the response. Perfect for Clay's "HTTP API" action.
 3.  **LinkedIn Scraper**: Built-in logic to scrape LinkedIn profiles, posts, and reactions using RapidAPI.
-4.  **Long Timeout Support**: Supports waiting up to 1 hour for job completion, handling large queues.
+4.  **Auto-Auth**: Automatically uses your API key from environment variables, so you don't have to expose it in every request.
+5.  **Long Timeout Support**: Supports waiting up to 1 hour for job completion, handling large queues.
 
 ---
 
@@ -41,13 +42,21 @@ This is the main endpoint you will use in Clay.
 
 Use this to get profile data, posts, and reactions.
 
-**Request Body:**
+**Request Body (Simplified):**
 ```json
 {
-  "username": "williamhgates",  // LinkedIn public ID
-  "api_key": "YOUR_RAPIDAPI_KEY", // Can also be set in GLOBAL_HEADERS env var
-  "include_experiences": true,
-  "sync": true                  // Default: true. Waits for result.
+  "username": "williamhgates" // LinkedIn public ID
+}
+```
+*Note: `sync` defaults to `true` (waits for result) and `api_key` is taken from env vars.*
+
+**Request Body (Full Options):**
+```json
+{
+  "username": "williamhgates",
+  "include_experiences": true, // Default: false (saves credits)
+  "include_skills": false,
+  "sync": true                 // Set to false for async webhook mode
 }
 ```
 
@@ -65,8 +74,7 @@ Use this to call *any* API with rate limiting.
 ```json
 {
   "target_api_url": "https://api.example.com/data",
-  "request_method": "GET",
-  "sync": true
+  "request_method": "GET"
 }
 ```
 
@@ -81,14 +89,12 @@ Use this to call *any* API with rate limiting.
 5.  **Body**:
     ```json
     {
-      "username": "{{LinkedIn URL}}", 
-      "api_key": "YOUR_KEY",
-      "sync": true
+      "username": "{{LinkedIn URL}}"
     }
     ```
-    *(Note: You might need to use a formula to extract the username from a full LinkedIn URL)*
+    *(Note: Use a Clay formula if you need to extract just the username from a URL, e.g. `williamhgates` from `linkedin.com/in/williamhgates`)*
 
-6.  **Run**: Clay will send the request, wait (potentially minutes), and put the final result in the cell.
+6.  **Operation**: The column will send the request, hang/wait for your turn in the queue (handled by the server), and populate the cell with the scraped data once done.
 
 ---
 
