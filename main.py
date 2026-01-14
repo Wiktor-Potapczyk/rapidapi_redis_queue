@@ -549,6 +549,14 @@ async def queue_job(request: Request, response: Response):
         return {"error": "Invalid JSON"}
 
     # Detect job type
+    
+    # Auto-fill api_key from GLOBAL_HEADERS if missing
+    if 'api_key' not in body:
+        for k, v in GLOBAL_HEADERS.items():
+            if k.lower() == 'x-rapidapi-key':
+                body['api_key'] = v
+                break
+
     is_linkedin_job = (
         ('username' in body or 'urn' in body) and
         'api_key' in body and
