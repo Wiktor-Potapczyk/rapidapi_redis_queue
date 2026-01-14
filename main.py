@@ -420,13 +420,13 @@ async def process_job(job: Dict[str, Any]):
             logger.info(f"Processing generic API job {job_id} -> {method} {target_url}")
 
             if method == 'POST':
-                response = await client.post(target_url, headers=headers, json=request_body, timeout=30.0)
+                response = await client.post(target_url, headers=headers, json=request_body, timeout=120.0)
             elif method == 'PUT':
-                response = await client.put(target_url, headers=headers, json=request_body, timeout=30.0)
+                response = await client.put(target_url, headers=headers, json=request_body, timeout=120.0)
             elif method == 'DELETE':
-                response = await client.delete(target_url, headers=headers, timeout=30.0)
+                response = await client.delete(target_url, headers=headers, timeout=120.0)
             else:
-                response = await client.get(target_url, headers=headers, timeout=30.0)
+                response = await client.get(target_url, headers=headers, timeout=120.0)
 
             try:
                 response_data = response.json()
@@ -495,7 +495,7 @@ async def queue_worker():
                     start_time = time.monotonic()
 
                     try:
-                        await asyncio.wait_for(process_job(job), timeout=60.0)
+                        await asyncio.wait_for(process_job(job), timeout=300.0)
                     except asyncio.TimeoutError:
                         logger.error(f"Job {job.get('job_id')} timed out")
                         await update_job_status(job['job_id'], "timeout")
