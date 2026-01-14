@@ -602,12 +602,40 @@ async def queue_job(request: Request, response: Response):
 
     logger.info(f"Queued {job_id} (type: {body['job_type']}) at position {queue_position}")
 
+    # Synchronous processing (wait for result)
+    if body.get('sync', True):  # Default to True per user request
+        start_wait = time.time()
+        max_wait = 300  # 5 minutes timeout or configure via env
+        
+        while time.time() - start_wait < max_wait:
+            if redis_client:
+                data = await redis_client.get(f"{REDIS_JOB_PREFIX}{job_id}")
+                if data:
+                    job_data = json.loads(data)
+                    status = job_data.get("status")
+                    
+                    if status == "completed":
+                        return job_data.get("result")
+                    elif status == "failed":
+                        response.status_code = 500
+                        return {"error": job_data.get("error")}
+                    elif status == "timeout":
+                         response.status_code = 504
+                         return {"error": "Job timed out in worker"}
+            
+            await asyncio.sleep(1) # Poll every 1s
+
+        response.status_code = 504
+        return {"error": "Timeout waiting for job completion"}
+
+    # Async processing (return 202)
     response.status_code = 202
     return {
         "job_id": job_id,
         "status": "queued",
         "job_type": body['job_type'],
-        "queue_position": queue_position
+        "queue_position": queue_position,
+        "mode": "async" 
     }
 
 
